@@ -215,15 +215,32 @@ def upload_file(filepath, filename):
     if not drive_client:
         raise RuntimeError("Drive baglantisi yok")
     
-    meta = {"title": filename}
-    if GDRIVE_FOLDER_ID:
-        meta["parents"] = [{"id": GDRIVE_FOLDER_ID}]
+    if not GDRIVE_FOLDER_ID:
+        raise RuntimeError(
+            "GDRIVE_FOLDER_ID ayarlanmamis! "
+            "Service Account ile yukleme icin paylasilan bir klasor ID'si gerekli."
+        )
+    
+    meta = {
+        "title": filename,
+        "parents": [{"id": GDRIVE_FOLDER_ID}]
+    }
     
     gf = drive_client.CreateFile(meta)
     gf.SetContentFile(filepath)
     gf.Upload()
+    
+    # Herkese acik link yap
+    gf.InsertPermission({
+        "type": "anyone",
+        "role": "reader",
+        "value": "anyone"
+    })
+    
+    # Guncellenmis linki al
+    gf.FetchMetadata(fields="alternateLink,webContentLink")
+    
     return gf
-
 # ═══════════════════════════════════════════════
 # AUTO DELETE
 # ═══════════════════════════════════════════════
