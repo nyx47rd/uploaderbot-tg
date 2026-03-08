@@ -107,19 +107,25 @@ init_db()
 flask_app = Flask(__name__)
 flask_app.secret_key = SECRET_KEY
 
+# HTTPS zorla (Render proxy arkasında)
+from werkzeug.middleware.proxy_fix import ProxyFix
+flask_app.wsgi_app = ProxyFix(flask_app.wsgi_app, x_proto=1, x_host=1)
+
 def get_flow():
+    redirect_uri = "https://uploaderbot-6bck.onrender.com/callback"
+    
     return Flow.from_client_config(
         {
             "web": {
                 "client_id": GOOGLE_CLIENT_ID,
                 "client_secret": GOOGLE_CLIENT_SECRET,
-                "redirect_uris": [url_for("callback", _external=True)],
+                "redirect_uris": [redirect_uri],
                 "auth_uri": "https://accounts.google.com/o/oauth2/auth",
                 "token_uri": "https://oauth2.googleapis.com/token",
             }
         },
         scopes=SCOPES,
-        redirect_uri=url_for("callback", _external=True)
+        redirect_uri=redirect_uri
     )
 
 @flask_app.route("/")
