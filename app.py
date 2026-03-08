@@ -1,6 +1,7 @@
 import os
 import json
 import tempfile
+import traceback
 from flask import Flask
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
@@ -39,6 +40,16 @@ def test():
         folder = service.files().get(fileId=GDRIVE_FOLDER_ID, fields="id,name").execute()
         r.append(f"✅ Klasor: {folder.get('name')}")
         
+        # Kota bilgisi
+        r.append("--- About bilgisi ---")
+        try:
+            about = service.about().get(fields="user,storageQuota").execute()
+            r.append(f"User: {about.get('user', {}).get('emailAddress')}")
+            r.append(f"Quota: {about.get('storageQuota')}")
+        except Exception as e2:
+            r.append(f"About hatasi: {e2}")
+        
+        r.append("--- Yukleme deneniyor ---")
         media = MediaInMemoryUpload(b"test 123", mimetype="text/plain")
         file_meta = {"name": "test.txt", "parents": [GDRIVE_FOLDER_ID]}
         
@@ -54,7 +65,10 @@ def test():
         r.append("✅ Test dosyasi silindi")
         
     except Exception as e:
-        r.append(f"❌ HATA: {type(e).__name__}: {e}")
+        r.append(f"❌ HATA TIPI: {type(e).__name__}")
+        r.append(f"❌ HATA MESAJI: {str(e)}")
+        r.append("--- TRACEBACK ---")
+        r.append(traceback.format_exc())
     
     return "<pre>" + "\n".join(r) + "</pre>"
 
