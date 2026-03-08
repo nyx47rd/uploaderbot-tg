@@ -1,8 +1,15 @@
+import collections
+import collections.abc
+# Monkeypatch for pySmartDL compatibility with Python 3.10+
+collections.Iterable = collections.abc.Iterable
+
 import os
 import json
 import logging
 import tempfile
 import asyncio
+import threading
+from http.server import HTTPServer, BaseHTTPRequestHandler
 from datetime import datetime, timedelta
 from pySmartDL import SmartDL
 from pydrive2.auth import GoogleAuth
@@ -114,8 +121,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         status_message = await update.message.reply_text("⏳ İşlem sıraya alındı ve başlatılıyor...")
 
         try:
-            # Download
-            dest = tempfile.gettempdir()
+            # Download to current directory instead of /tmp for HF Spaces compatibility with large files
+            dest = os.getcwd()
             await status_message.edit_text("📥 Dosya sunucuya indiriliyor...")
 
             obj = await asyncio.to_thread(download_file, url, dest)
@@ -162,10 +169,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Error during processing: {e}")
             await update.message.reply_text(f"❌ Bir hata oluştu: {str(e)}")
 
+# Simple health check server for Hugging Face Spaces
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"Bot is running!")
+
+def run_health_check_server():
+    port = int(os.environ.get("PORT", 7860))
+    server_address = ('', port)
+    httpd = HTTPServer(server_address, HealthCheckHandler)
+    logger.info(f"Starting health check server on port {port}...")
+    httpd.serve_forever()
+
 def main():
     if not BOT_TOKEN:
         logger.error("BOT_TOKEN not found!")
         return
+
+    # Start health check server in a separate thread
+    threading.Thread(target=run_health_check_server, daemon=True).start()
 
     # Initialize Drive Client
     get_gdrive_client()

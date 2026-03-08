@@ -23,5 +23,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Copy the current directory contents into the container at /app
 COPY . .
 
-# Run main.py when the container launches
-CMD ["python", "main.py"]
+# Expose the port used by the health check server (Hugging Face default)
+EXPOSE 7860
+
+# Run app.py when the container launches
+CMD ["python", "app.py"]

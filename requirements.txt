@@ -2,5 +2,4 @@ python-telegram-bot
 pySmartDL
 PyDrive2
 apscheduler
-python-dotenv
 oauth2client
