@@ -8,7 +8,6 @@ import logging
 import tempfile
 import asyncio
 import threading
-import time
 from datetime import datetime, timedelta
 from flask import Flask
 
@@ -55,16 +54,11 @@ flask_app = Flask(__name__)
 
 @flask_app.route("/")
 def health():
-    return "OK", 200
+    return "Bot is running!", 200
 
 @flask_app.route("/health")
 def health2():
     return "OK", 200
-
-def run_flask():
-    port = int(os.environ.get("PORT", 10000))
-    logger.info(f"Flask starting on port {port}")
-    flask_app.run(host="0.0.0.0", port=port, threaded=True)
 
 # ═══════════════════════════════════════════════
 # GOOGLE DRIVE
@@ -230,37 +224,41 @@ async def run_bot():
     
     get_drive()
 
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .connect_timeout(30)
-        .read_timeout(30)
-        .build()
-    )
+    app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
-    async with app:
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-        logger.info("✅ Bot is running!")
-        
-        # Sonsuza kadar çalış
+    logger.info("Starting polling...")
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+    logger.info("✅ Bot is running!")
+    
+    # Sonsuza kadar çalış
+    try:
         while True:
             await asyncio.sleep(3600)
+    except asyncio.CancelledError:
+        logger.info("Bot stopping...")
+        await app.updater.stop()
+        await app.stop()
+        await app.shutdown()
 
 def start_bot_thread():
-    asyncio.run(run_bot())
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(run_bot())
 
 # ═══════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════
 if __name__ == "__main__":
-    # 1) Bot'u ayrı thread'de başlat
+    # Bot'u ayrı thread'de başlat
     bot_thread = threading.Thread(target=start_bot_thread, daemon=True)
     bot_thread.start()
     logger.info("✅ Bot thread started")
     
-    # 2) Flask ana thread'de çalışsın (Render bunu bekler)
-    run_flask()
+    # Flask
+    port = int(os.environ.get("PORT", 10000))
+    flask_app.run(host="0.0.0.0", port=port)
