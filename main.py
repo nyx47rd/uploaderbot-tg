@@ -10,7 +10,7 @@ from pydrive2.drive import GoogleDrive
 from oauth2client.service_account import ServiceAccountCredentials
 from telegram import Update
 from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
-from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # Logging setup
 logging.basicConfig(
@@ -60,18 +60,18 @@ def get_gdrive_client():
         return None
 
 # Scheduler for automatic deletion
-scheduler = BackgroundScheduler()
+scheduler = AsyncIOScheduler()
 scheduler.start()
 
-def delete_from_drive(file_id):
+async def delete_from_drive(file_id):
     try:
         global drive_client
         if not drive_client:
-            drive_client = get_gdrive_client()
+            drive_client = await asyncio.to_thread(get_gdrive_client)
 
         if drive_client:
-            file = drive_client.CreateFile({'id': file_id})
-            file.Delete()
+            file = await asyncio.to_thread(drive_client.CreateFile, {'id': file_id})
+            await asyncio.to_thread(file.Delete)
             logger.info(f"File {file_id} deleted successfully after 2 hours.")
     except Exception as e:
         logger.error(f"Error deleting file {file_id}: {e}")
