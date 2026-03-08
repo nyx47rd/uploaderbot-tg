@@ -1,5 +1,6 @@
-python-telegram-bot
-pySmartDL
-PyDrive2
-apscheduler
-oauth2client
+python-telegram-bot==20.7
+pySmartDL==1.3.4
+PyDrive2==1.19.0
+oauth2client==4.1.3
+APScheduler==3.10.4
+flask==3.0.0
