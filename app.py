@@ -9,6 +9,7 @@ import tempfile
 import asyncio
 import threading
 import time
+import uuid
 import humanize
 from datetime import datetime, timedelta
 from flask import Flask
@@ -17,8 +18,8 @@ from pySmartDL import SmartDL
 from pydrive2.auth import GoogleAuth
 from pydrive2.drive import GoogleDrive
 from oauth2client.service_account import ServiceAccountCredentials
-from telegram import Update, BotCommand
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram import Update, BotCommand, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters, ContextTypes
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ═══════════════════════════════════════════════
@@ -45,8 +46,11 @@ if AUTHORIZED_USER_ID:
     except:
         AUTHORIZED_USER_ID = None
 
-# Kullanıcı ayarları (in-memory)
+# Kullanıcı ayarları
 user_settings = {}
+
+# Aktif indirmeler: {task_id: {...}}
+active_downloads = {}
 
 # İstatistikler
 stats = {
@@ -59,7 +63,6 @@ logger.info(f"BOT_TOKEN: {bool(BOT_TOKEN)}")
 logger.info(f"GDRIVE_JSON: {bool(GDRIVE_SERVICE_ACCOUNT_JSON)}")
 logger.info(f"FOLDER_ID: {bool(GDRIVE_FOLDER_ID)}")
 logger.info(f"AUTH_USER: {AUTHORIZED_USER_ID}")
-logger.info(f"DEFAULT_DELETE_HOURS: {DEFAULT_DELETE_HOURS}")
 
 # ═══════════════════════════════════════════════
 # FLASK - HEALTH CHECK
@@ -69,11 +72,13 @@ flask_app = Flask(__name__)
 @flask_app.route("/")
 def health():
     uptime = datetime.now() - stats["start_time"]
+    active = len(active_downloads)
     return f"""
-    <h1>🤖 Upload Bot Status</h1>
-    <p>✅ Bot is running!</p>
-    <p>📊 Total uploads: {stats['total_uploads']}</p>
-    <p>📦 Total uploaded: {humanize.naturalsize(stats['total_bytes'])}</p>
+    <h1>🤖 Upload Bot</h1>
+    <p>✅ Çalışıyor</p>
+    <p>📊 Yükleme: {stats['total_uploads']}</p>
+    <p>📦 Toplam: {humanize.naturalsize(stats['total_bytes'])}</p>
+    <p>🔄 Aktif: {active}</p>
     <p>⏱️ Uptime: {humanize.naturaldelta(uptime)}</p>
     """, 200
 
@@ -106,13 +111,15 @@ def get_drive():
 # ═══════════════════════════════════════════════
 # HELPERS
 # ═══════════════════════════════════════════════
-def format_size(bytes):
-    return humanize.naturalsize(bytes, binary=True)
+def format_size(bytes_val):
+    return humanize.naturalsize(bytes_val, binary=True)
 
 def format_speed(bytes_per_sec):
     return f"{humanize.naturalsize(bytes_per_sec, binary=True)}/s"
 
 def format_time(seconds):
+    if seconds < 0:
+        return "∞"
     if seconds < 60:
         return f"{int(seconds)}s"
     elif seconds < 3600:
@@ -120,100 +127,54 @@ def format_time(seconds):
     else:
         return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
 
-def create_progress_bar(percent, length=20):
+def create_progress_bar(percent, length=15):
+    percent = min(100, max(0, percent))
     filled = int(length * percent / 100)
     bar = "█" * filled + "░" * (length - filled)
-    return f"[{bar}] {percent:.1f}%"
+    return f"[{bar}]"
 
-async def download_with_progress(url, dest_dir, status_msg, msg_prefix="📥"):
-    """İndirme işlemi - canlı ilerleme güncellemesi ile"""
-    os.makedirs(dest_dir, exist_ok=True)
-    
-    obj = SmartDL(url, dest_dir, progress_bar=False, timeout=300)
-    obj.start(blocking=False)
-    
-    last_update = 0
-    update_interval = 2  # Her 2 saniyede bir güncelle
-    
-    while not obj.isFinished():
-        await asyncio.sleep(0.5)
-        
-        current_time = time.time()
-        if current_time - last_update >= update_interval:
-            try:
-                progress = obj.get_progress() * 100
-                speed = obj.get_speed(human=False) or 0
-                eta = obj.get_eta(human=False) or 0
-                downloaded = obj.get_dl_size()
-                total = obj.get_final_filesize() or 0
-                
-                progress_bar = create_progress_bar(progress)
-                
-                status_text = (
-                    f"{msg_prefix} **İndiriliyor...**\n\n"
-                    f"{progress_bar}\n\n"
-                    f"📦 Boyut: {format_size(downloaded)}"
-                )
-                
-                if total > 0:
-                    status_text += f" / {format_size(total)}"
-                
-                status_text += f"\n⚡ Hız: {format_speed(speed)}"
-                
-                if eta > 0:
-                    status_text += f"\n⏱️ Kalan: {format_time(eta)}"
-                
-                await status_msg.edit_text(status_text, parse_mode="Markdown")
-                last_update = current_time
-            except Exception as e:
-                logger.debug(f"Progress update error: {e}")
-    
-    return obj
-
-async def upload_with_progress(filepath, filename, status_msg, msg_prefix="📤"):
-    """Yükleme işlemi - ilerleme güncellemesi ile"""
-    global drive_client
-    
-    if not drive_client:
-        get_drive()
-    if not drive_client:
-        raise RuntimeError("No Drive client")
-    
-    file_size = os.path.getsize(filepath)
-    
-    await status_msg.edit_text(
-        f"{msg_prefix} **Google Drive'a yükleniyor...**\n\n"
-        f"📁 Dosya: `{filename}`\n"
-        f"📦 Boyut: {format_size(file_size)}\n\n"
-        f"⏳ Lütfen bekleyin...",
-        parse_mode="Markdown"
-    )
-    
-    meta = {"title": filename}
-    if GDRIVE_FOLDER_ID:
-        meta["parents"] = [{"id": GDRIVE_FOLDER_ID}]
-    
-    gf = await asyncio.to_thread(_upload_file_sync, filepath, meta)
-    
-    return gf, file_size
-
-def _upload_file_sync(filepath, meta):
-    """Senkron yükleme işlemi"""
-    gf = drive_client.CreateFile(meta)
-    gf.SetContentFile(filepath)
-    gf.Upload()
-    return gf
+def get_delete_hours(user_id):
+    return user_settings.get(user_id, {}).get("delete_hours", DEFAULT_DELETE_HOURS)
 
 async def auto_delete(file_id, filename, hours):
-    """Otomatik silme işlemi"""
     try:
         global drive_client
         if drive_client:
             gf = await asyncio.to_thread(drive_client.CreateFile, {"id": file_id})
             await asyncio.to_thread(gf.Delete)
-            logger.info(f"🗑️ Auto-deleted: {filename} ({file_id}) after {hours}h")
+            logger.info(f"🗑️ Silindi: {filename}")
     except Exception as e:
-        logger.error(f"Delete error: {e}")
+        logger.error(f"Silme hatası: {e}")
+
+# ═══════════════════════════════════════════════
+# DOWNLOAD MANAGER
+# ═══════════════════════════════════════════════
+class DownloadTask:
+    def __init__(self, task_id, url, user_id, message):
+        self.task_id = task_id
+        self.url = url
+        self.user_id = user_id
+        self.message = message
+        self.status = "pending"  # pending, downloading, uploading, completed, cancelled, failed
+        self.progress = 0
+        self.speed = 0
+        self.eta = 0
+        self.downloaded = 0
+        self.total_size = 0
+        self.filename = ""
+        self.filepath = ""
+        self.cancelled = False
+        self.start_time = time.time()
+        self.smartdl = None
+    
+    def cancel(self):
+        self.cancelled = True
+        if self.smartdl:
+            try:
+                self.smartdl.stop()
+            except:
+                pass
+        self.status = "cancelled"
 
 # ═══════════════════════════════════════════════
 # BOT HANDLERS
@@ -221,70 +182,52 @@ async def auto_delete(file_id, filename, hours):
 lock = None
 sched = None
 
-def get_delete_hours(user_id):
-    """Kullanıcının silme süresini al"""
-    return user_settings.get(user_id, {}).get("delete_hours", DEFAULT_DELETE_HOURS)
-
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if AUTHORIZED_USER_ID and update.effective_user.id != AUTHORIZED_USER_ID:
         return
     
     delete_hours = get_delete_hours(update.effective_user.id)
     
-    welcome_text = """
+    text = f"""
 🚀 **Upload Bot'a Hoş Geldin!**
 
-Bana bir direkt indirme linki gönder, senin için:
-1️⃣ Dosyayı sunucuya indirir
-2️⃣ Google Drive'a yükler
-3️⃣ Sana link verir
-4️⃣ Belirlenen süre sonra otomatik siler
+Bir link gönder, ben hallederim:
+1️⃣ İndir → 2️⃣ Drive'a yükle → 3️⃣ Link ver
 
-**📋 Komutlar:**
-/help - Yardım menüsü
-/settime <saat> - Silme süresini ayarla
-/status - Bot durumu ve istatistikler
+**Komutlar:**
+/downloads - Aktif indirmeler
+/settime <saat> - Silme süresi ({delete_hours}h)
+/status - İstatistikler
+/help - Yardım
 
-**⚙️ Mevcut Ayarlar:**
-⏱️ Otomatik silme: {hours} saat sonra
-
-**📝 Kullanım:**
-Sadece bir link gönder! Örnek:
-`https://example.com/file.zip`
-""".format(hours=delete_hours)
-    
-    await update.message.reply_text(welcome_text, parse_mode="Markdown")
+Sadece link gönder! 👇
+"""
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if AUTHORIZED_USER_ID and update.effective_user.id != AUTHORIZED_USER_ID:
         return
     
-    help_text = """
-📚 **Yardım Menüsü**
+    text = """
+📚 **Yardım**
 
-**🔗 Link Gönderme:**
-Direkt indirme linki gönder. Bot otomatik olarak:
-• Dosyayı indirir (ilerleme gösterir)
-• Google Drive'a yükler
-• Paylaşılabilir link verir
+**Link Gönder:**
+`https://example.com/file.zip`
 
-**⏱️ Silme Süresini Ayarlama:**
-`/settime 1` → 1 saat sonra sil
-`/settime 6` → 6 saat sonra sil
-`/settime 24` → 24 saat sonra sil
-`/settime 0` → Silme (kalıcı)
+**Silme Süresi:**
+`/settime 1` → 1 saat
+`/settime 24` → 24 saat
+`/settime 0` → Kalıcı
 
-**📊 Desteklenen Limitler:**
-• Maksimum dosya: 5GB
-• Timeout: 5 dakika
+**İndirme Yönetimi:**
+`/downloads` → Aktif liste
+İptal butonu ile durdur
 
-**💡 İpuçları:**
-• Direkt indirme linki kullan
-• Kısa linkler (bit.ly vb.) çalışmayabilir
-• Google Drive linki değil, dosya linki gönder
+**Limitler:**
+• Max: 5GB
+• Timeout: 5dk
 """
-    
-    await update.message.reply_text(help_text, parse_mode="Markdown")
+    await update.message.reply_text(text, parse_mode="Markdown")
 
 async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if AUTHORIZED_USER_ID and update.effective_user.id != AUTHORIZED_USER_ID:
@@ -295,26 +238,363 @@ async def cmd_settime(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
         current = get_delete_hours(user_id)
         await update.message.reply_text(
-            f"⏱️ Mevcut silme süresi: **{current} saat**\n\n"
-            f"Değiştirmek için: `/settime <saat>`\n"
-            f"Örnek: `/settime 6` → 6 saat sonra sil\n"
-            f"Kalıcı: `/settime 0` → Hiç silme",
+            f"⏱️ Şu an: **{current} saat**\n`/settime <saat>` ile değiştir",
             parse_mode="Markdown"
         )
         return
     
     try:
         hours = int(context.args[0])
-        if hours < 0 or hours > 168:  # Max 1 hafta
-            await update.message.reply_text("⚠️ Süre 0-168 saat arası olmalı.")
+        if hours < 0 or hours > 168:
+            await update.message.reply_text("⚠️ 0-168 arası olmalı")
             return
         
         if user_id not in user_settings:
             user_settings[user_id] = {}
         user_settings[user_id]["delete_hours"] = hours
         
-        if hours == 0:
-            await update.message.reply_text("✅ Dosyalar artık **silinmeyecek** (kalıcı).", parse_mode="Markdown")
+        msg = "♾️ Kalıcı" if hours == 0 else f"⏱️ {hours} saat"
+        await update.message.reply_text(f"✅ Ayarlandı: {msg}")
+    except ValueError:
+        await update.message.reply_text("⚠️ Sayı girin: `/settime 6`", parse_mode="Markdown")
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if AUTHORIZED_USER_ID and update.effective_user.id != AUTHORIZED_USER_ID:
+        return
+    
+    uptime = datetime.now() - stats["start_time"]
+    jobs = len(sched.get_jobs()) if sched else 0
+    active = len([t for t in active_downloads.values() if t.status in ("downloading", "uploading")])
+    
+    text = f"""
+📊 **Bot Durumu**
+
+**Sistem:**
+✅ Çalışıyor | ⏱️ {humanize.naturaldelta(uptime)}
+💾 Drive: {"✅" if drive_client else "❌"}
+
+**İstatistik:**
+📤 Yükleme: {stats['total_uploads']}
+📦 Toplam: {format_size(stats['total_bytes'])}
+🔄 Aktif: {active}
+🗑️ Bekleyen silme: {jobs}
+"""
+    await update.message.reply_text(text, parse_mode="Markdown")
+
+async def cmd_downloads(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if AUTHORIZED_USER_ID and update.effective_user.id != AUTHORIZED_USER_ID:
+        return
+    
+    user_id = update.effective_user.id
+    user_tasks = [t for t in active_downloads.values() 
+                  if t.user_id == user_id and t.status in ("downloading", "uploading", "pending")]
+    
+    if not user_tasks:
+        await update.message.reply_text("📭 Aktif indirme yok.")
+        return
+    
+    text = "📥 **Aktif İndirmeler:**\n\n"
+    buttons = []
+    
+    for task in user_tasks:
+        status_emoji = {"pending": "⏳", "downloading": "📥", "uploading": "📤"}.get(task.status, "❓")
+        name = task.filename[:25] + "..." if len(task.filename) > 25 else (task.filename or "İndiriliyor...")
+        
+        text += f"{status_emoji} `{name}`\n"
+        text += f"   {create_progress_bar(task.progress)} {task.progress:.0f}%\n\n"
+        
+        buttons.append([InlineKeyboardButton(f"❌ İptal: {name[:15]}", callback_data=f"cancel_{task.task_id}")])
+    
+    keyboard = InlineKeyboardMarkup(buttons)
+    await update.message.reply_text(text, parse_mode="Markdown", reply_markup=keyboard)
+
+async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    
+    if AUTHORIZED_USER_ID and query.from_user.id != AUTHORIZED_USER_ID:
+        return
+    
+    data = query.data
+    
+    if data.startswith("cancel_"):
+        task_id = data.replace("cancel_", "")
+        
+        if task_id in active_downloads:
+            task = active_downloads[task_id]
+            task.cancel()
+            
+            # Dosyayı temizle
+            if task.filepath and os.path.exists(task.filepath):
+                try:
+                    os.remove(task.filepath)
+                except:
+                    pass
+            
+            await query.edit_message_text(f"❌ İptal edildi: `{task.filename or 'İndirme'}`", parse_mode="Markdown")
+        else:
+            await query.edit_message_text("⚠️ İndirme bulunamadı (zaten bitti olabilir)")
+
+async def on_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global lock, sched, stats, active_downloads
+
+    if AUTHORIZED_USER_ID and update.effective_user.id != AUTHORIZED_USER_ID:
+        return
+
+    url = update.message.text.strip()
+    if not url.startswith(("http://", "https://")):
+        await update.message.reply_text("⛔ Geçersiz link")
+        return
+
+    user_id = update.effective_user.id
+    delete_hours = get_delete_hours(user_id)
+    
+    # Yeni task oluştur
+    task_id = str(uuid.uuid4())[:8]
+    
+    # İptal butonu
+    keyboard = InlineKeyboardMarkup([
+        [InlineKeyboardButton("❌ İptal", callback_data=f"cancel_{task_id}")]
+    ])
+    
+    msg = await update.message.reply_text(
+        "🔄 **Başlatılıyor...**",
+        parse_mode="Markdown",
+        reply_markup=keyboard
+    )
+    
+    task = DownloadTask(task_id, url, user_id, msg)
+    active_downloads[task_id] = task
+
+    async with lock:
+        fp = None
+        try:
+            dest = os.path.join(os.getcwd(), "downloads")
+            os.makedirs(dest, exist_ok=True)
+            
+            # ═══════════════════════════════════════
+            # İNDİRME
+            # ═══════════════════════════════════════
+            task.status = "downloading"
+            
+            await msg.edit_text(
+                "📥 **İndirme başlıyor...**\n\n⏳ Bağlanıyor...",
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
+            
+            # SmartDL başlat - BLOCKING=TRUE kullan, thread içinde çalıştır
+            def do_download():
+                obj = SmartDL(url, dest, progress_bar=False, timeout=300)
+                task.smartdl = obj
+                obj.start(blocking=False)
+                return obj
+            
+            obj = await asyncio.to_thread(do_download)
+            
+            last_update = 0
+            update_interval = 1.5
+            
+            while not obj.isFinished():
+                if task.cancelled:
+                    raise asyncio.CancelledError("Kullanıcı iptal etti")
+                
+                await asyncio.sleep(0.3)
+                
+                now = time.time()
+                if now - last_update >= update_interval:
+                    try:
+                        task.progress = (obj.get_progress() or 0) * 100
+                        task.speed = obj.get_speed(human=False) or 0
+                        task.eta = obj.get_eta(human=False) or 0
+                        task.downloaded = obj.get_dl_size() or 0
+                        task.total_size = obj.get_final_filesize() or 0
+                        
+                        # Dosya adını almaya çalış
+                        if not task.filename:
+                            try:
+                                dest_path = obj.get_dest()
+                                if dest_path:
+                                    task.filename = os.path.basename(dest_path)
+                            except:
+                                pass
+                        
+                        bar = create_progress_bar(task.progress)
+                        
+                        text = f"📥 **İndiriliyor...**\n\n"
+                        
+                        if task.filename:
+                            text += f"📁 `{task.filename}`\n\n"
+                        
+                        text += f"{bar} **{task.progress:.1f}%**\n\n"
+                        text += f"📦 {format_size(task.downloaded)}"
+                        
+                        if task.total_size > 0:
+                            text += f" / {format_size(task.total_size)}"
+                        
+                        text += f"\n⚡ {format_speed(task.speed)}"
+                        
+                        if task.eta > 0 and task.eta < 86400:
+                            text += f"\n⏱️ Kalan: {format_time(task.eta)}"
+                        
+                        await msg.edit_text(text, parse_mode="Markdown", reply_markup=keyboard)
+                        last_update = now
+                    except Exception as e:
+                        logger.debug(f"Update error: {e}")
+            
+            if task.cancelled:
+                raise asyncio.CancelledError("Kullanıcı iptal etti")
+            
+            if not obj.isSuccessful():
+                raise Exception("İndirme başarısız")
+            
+            fp = obj.get_dest()
+            task.filepath = fp
+            task.filename = os.path.basename(fp)
+            sz = os.path.getsize(fp)
+            task.total_size = sz
+            
+            # Boyut kontrolü
+            if sz > 5 * 1024**3:
+                await msg.edit_text(
+                    f"⚠️ **Çok büyük!**\n\n{format_size(sz)} > 5GB limit",
+                    parse_mode="Markdown"
+                )
+                os.remove(fp)
+                fp = None
+                del active_downloads[task_id]
+                return
+            
+            # ═══════════════════════════════════════
+            # YÜKLEME
+            # ═══════════════════════════════════════
+            task.status = "uploading"
+            task.progress = 0
+            
+            await msg.edit_text(
+                f"📤 **Drive'a yükleniyor...**\n\n"
+                f"📁 `{task.filename}`\n"
+                f"📦 {format_size(sz)}\n\n"
+                f"⏳ Lütfen bekleyin...",
+                parse_mode="Markdown",
+                reply_markup=keyboard
+            )
+            
+            if task.cancelled:
+                raise asyncio.CancelledError("Kullanıcı iptal etti")
+            
+            # Yükleme
+            def do_upload():
+                global drive_client
+                if not drive_client:
+                    get_drive()
+                if not drive_client:
+                    raise RuntimeError("Drive bağlantısı yok")
+                
+                meta = {"title": task.filename}
+                if GDRIVE_FOLDER_ID:
+                    meta["parents"] = [{"id": GDRIVE_FOLDER_ID}]
+                
+                gf = drive_client.CreateFile(meta)
+                gf.SetContentFile(fp)
+                gf.Upload()
+                return gf
+            
+            gf = await asyncio.to_thread(do_upload)
+            
+            if task.cancelled:
+                raise asyncio.CancelledError("Kullanıcı iptal etti")
+            
+            fid = gf["id"]
+            link = gf.get("alternateLink", f"https://drive.google.com/file/d/{fid}/view")
+            
+            # İstatistikleri güncelle
+            stats["total_uploads"] += 1
+            stats["total_bytes"] += sz
+            
+            elapsed = time.time() - task.start_time
+            
+            # ═══════════════════════════════════════
+            # TAMAMLANDI
+            # ═══════════════════════════════════════
+            task.status = "completed"
+            
+            result = (
+                f"✅ **Tamamlandı!**\n\n"
+                f"📁 `{task.filename}`\n"
+                f"📦 {format_size(sz)}\n"
+                f"⏱️ {format_time(elapsed)}\n\n"
+                f"🔗 [Google Drive]({link})\n\n"
+            )
+            
+            if delete_hours > 0:
+                delete_time = datetime.now() + timedelta(hours=delete_hours)
+                result += f"🗑️ {delete_hours}h sonra silinecek"
+                
+                sched.add_job(
+                    auto_delete, "date",
+                    run_date=delete_time,
+                    args=[fid, task.filename, delete_hours]
+                )
+            else:
+                result += "♾️ Kalıcı"
+            
+            await msg.edit_text(result, parse_mode="Markdown", disable_web_page_preview=True)
+            
+            # Temizle
+            if fp and os.path.exists(fp):
+                os.remove(fp)
+                fp = None
+            
+            del active_downloads[task_id]
+        
+        except asyncio.CancelledError:
+            task.status = "cancelled"
+            await msg.edit_text("❌ **İptal edildi**", parse_mode="Markdown")
+            if fp and os.path.exists(fp):
+                try:
+                    os.remove(fp)
+                except:
+                    pass
+            if task_id in active_downloads:
+                del active_downloads[task_id]
+        
+        except Exception as e:
+            task.status = "failed"
+            logger.error(f"Error: {e}", exc_info=True)
+            await msg.edit_text(f"❌ **Hata!**\n\n`{str(e)[:100]}`", parse_mode="Markdown")
+            if fp and os.path.exists(fp):
+                try:
+                    os.remove(fp)
+                except:
+                    pass
+            if task_id in active_downloads:
+                del active_downloads[task_id]
+
+# ═══════════════════════════════════════════════
+# BOT RUNNER
+# ═══════════════════════════════════════════════
+async def run_bot():
+    global lock, sched
+
+    if not BOT_TOKEN:
+        logger.error("❌ NO BOT_TOKEN")
+        return
+
+    logger.info("Initializing bot...")
+    
+    lock = asyncio.Lock()
+    sched = AsyncIOScheduler()
+    sched.start()
+    
+    get_drive()
+
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("help", cmd_help))
+    app.add_handler(CommandHandler("settime", cmd_settime))
+    app.add_handler(CommandHareply_text("✅ Dosyalar artık **silinmeyecek** (kalıcı).", parse_mode="Markdown")
         else:
             await update.message.reply_text(f"✅ Silme süresi **{hours} saat** olarak ayarlandı.", parse_mode="Markdown")
     
