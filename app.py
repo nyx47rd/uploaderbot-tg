@@ -56,10 +56,6 @@ flask_app = Flask(__name__)
 def health():
     return "Bot is running!", 200
 
-@flask_app.route("/health")
-def health2():
-    return "OK", 200
-
 # ═══════════════════════════════════════════════
 # GOOGLE DRIVE
 # ═══════════════════════════════════════════════
@@ -68,7 +64,6 @@ drive_client = None
 def get_drive():
     global drive_client
     if not GDRIVE_SERVICE_ACCOUNT_JSON:
-        logger.warning("No GDRIVE_SERVICE_ACCOUNT_JSON")
         return None
     try:
         with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as f:
@@ -225,7 +220,6 @@ async def run_bot():
     get_drive()
 
     app = Application.builder().token(BOT_TOKEN).build()
-
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_message))
 
@@ -235,15 +229,8 @@ async def run_bot():
     await app.updater.start_polling(drop_pending_updates=True)
     logger.info("✅ Bot is running!")
     
-    # Sonsuza kadar çalış
-    try:
-        while True:
-            await asyncio.sleep(3600)
-    except asyncio.CancelledError:
-        logger.info("Bot stopping...")
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+    while True:
+        await asyncio.sleep(3600)
 
 def start_bot_thread():
     loop = asyncio.new_event_loop()
@@ -254,11 +241,9 @@ def start_bot_thread():
 # MAIN
 # ═══════════════════════════════════════════════
 if __name__ == "__main__":
-    # Bot'u ayrı thread'de başlat
     bot_thread = threading.Thread(target=start_bot_thread, daemon=True)
     bot_thread.start()
     logger.info("✅ Bot thread started")
     
-    # Flask
     port = int(os.environ.get("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port)
